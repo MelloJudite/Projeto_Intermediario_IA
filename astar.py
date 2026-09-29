@@ -1,208 +1,300 @@
 import heapq
-import numpy as np
-import cv2
-import matplotlib.pyplot as plt
-from scipy.ndimage import distance_transform_edt
 import math
 
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.ndimage import distance_transform_edt
+
+
 class AStarPathfinder:
-    def __init__(self, map_array: np.array, start: tuple, goal: tuple, wall_influence=5.0, buffer_factor=2.0):
-        """
-        Inicializa o A* com mapa, ponto inicial, objetivo e parâmetros de influência.
+    DIRECTIONS = ((-1, 0), (0, 1), (1, 0), (0, -1))
 
-        Args:
-            map_array (np.array): Mapa binário (obstáculos e caminho livre).
-            start (tuple): Ponto inicial (linha, coluna).
-            goal (tuple): Ponto objetivo (linha, coluna).
-            wall_influence (float): Peso da proximidade das paredes.
-            buffer_factor (float): Escala da influência das paredes.
+    def __init__(
+        self,
+        map_array: np.ndarray,
+        start: tuple[int, int],
+        goal: tuple[int, int] | None = None,
+        wall_influence: float = 10.0,
+        buffer_factor: float = 2.0,
+        safety_margin: float = 2.0,
+        exit_side: str = 'east',
+    ):
+        """Cria um planejador em coordenadas de pixel (linha, coluna).
+
+        Sem goal explícito, planeja em direção à borda indicada por exit_side.
+        Se ela ainda não estiver mapeada, retorna o trecho seguro conhecido mais
+        próximo dela. Folgas e custos são expressos em pixels do mapa.
         """
-        self.start = start
-        self.goal = goal
-        self.wall_influence = wall_influence
-        self.buffer_factor = buffer_factor
-        self.GOAL_REACHEABLE = False  
-        
-        # Prepara o mapa, expandindo suas bordas e ajustando o array.
-        self.map = map_array.copy()
+        if wall_influence < 0 or buffer_factor < 0:
+            raise ValueError('Pesos e distâncias não podem ser negativos.')
+        if safety_margin < 0:
+            raise ValueError('A margem de segurança não pode ser negativa.')
+        if exit_side not in ('north', 'east', 'south', 'west'):
+            raise ValueError('exit_side deve ser north, east, south ou west.')
+
         self.map_array = self.preprocess_map(map_array)
+        self.map = self.map_array
+        self.start = tuple(int(value) for value in start)
+        self.wall_influence = float(wall_influence)
+        self.buffer_factor = float(buffer_factor)
+        self.safety_margin = float(safety_margin)
+        self.exit_side = exit_side
+        self.goal_is_exit = goal is None
+        if goal is None:
+            self.goal = self._border_goal()
+        else:
+            self.goal = tuple(int(value) for value in goal)
+        self.GOAL_REACHEABLE = False
 
-        # Cria um campo potencial baseado no mapa para influenciar o caminho.
+        self.free_mask = self.map_array == 255
+        padded_free = np.pad(self.free_mask, 1, mode='constant', constant_values=True)
+        self.clearance_map = distance_transform_edt(padded_free)[1:-1, 1:-1]
+        self.safe_map = self.create_safety_margin()
         self.potential_field = self.create_potential_field()
-        
 
-    def preprocess_map(self, map_array: np.array) -> np.array:
-        """
-        Ajusta o mapa, convertendo valores intermediários para obstáculos.
+    def _border_goal(self) -> tuple[int, int]:
+        rows, columns = self.map_array.shape
+        if self.exit_side == 'north':
+            return 0, self.start[1]
+        if self.exit_side == 'south':
+            return rows - 1, self.start[1]
+        if self.exit_side == 'west':
+            return self.start[0], 0
+        return self.start[0], columns - 1
 
-        Args:
-            map_array (np.array): Mapa original.
+    @staticmethod
+    def preprocess_map(map_array: np.ndarray) -> np.ndarray:
+        """Normaliza o mapa para parede=0, desconhecido=128 e livre=255."""
+        source = np.asarray(map_array)
+        if source.ndim != 2:
+            raise ValueError('O mapa precisa ser uma imagem em escala de cinza 2D.')
 
-        Returns:
-            np.array: Mapa processado.
-        """
-        return None
+        result = np.zeros(source.shape, dtype=np.uint8)
+        result[(source == 128) | (source == 205)] = 128
+        result[source >= 240] = 255
+        return result
 
-    def create_potential_field(self) -> np.array:
-        """
-        Gera campo potencial com base na distância de obstáculos.
+    def create_potential_field(self) -> np.ndarray:
+        """Aumenta o custo perto de paredes e de áreas ainda não mapeadas."""
+        influence_range = max(self.buffer_factor, 1.0)
+        return self.wall_influence * np.exp(-self.clearance_map / influence_range)
 
-        Returns:
-            np.array: Campo potencial.
-        """
-        return None
+    def create_safety_margin(self) -> np.ndarray:
+        """Bloqueia células livres próximas demais de paredes ou do desconhecido."""
+        return self.free_mask & (self.clearance_map >= self.safety_margin + math.sqrt(2) / 2)
 
-    def heuristic(self, a: tuple, b: tuple) -> float:
-        """
-        Calcula a heurística entre dois pontos.
+    @staticmethod
+    def heuristic(a: tuple[int, int], b: tuple[int, int]) -> float:
+        """Distância Manhattan, adequada aos movimentos ortogonais do robô."""
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
-        Args:
-            a (tuple): Ponto A.
-            b (tuple): Ponto B.
+    def _inside_map(self, point: tuple[int, int]) -> bool:
+        return 0 <= point[0] < self.map_array.shape[0] and 0 <= point[1] < self.map_array.shape[1]
 
-        Returns:
-            float: Resultado da heurística.
-        """
+    def _distance_to_exit(self, point: tuple[int, int]) -> int:
+        rows, columns = self.map_array.shape
+        if self.exit_side == 'north':
+            return point[0]
+        if self.exit_side == 'south':
+            return rows - 1 - point[0]
+        if self.exit_side == 'west':
+            return point[1]
+        return columns - 1 - point[1]
 
-        return None
+    def _is_exit(self, point: tuple[int, int]) -> bool:
+        row, column = point
+        rows, columns = self.map_array.shape
+        return {
+            'north': row == 0,
+            'east': column == columns - 1,
+            'south': row == rows - 1,
+            'west': column == 0,
+        }[self.exit_side]
 
     def find_path(self):
-        """
-        Executa o algoritmo A* para encontrar caminho até o objetivo.
+        """Executa A* somente sobre células livres que respeitam a margem."""
+        if not self._inside_map(self.start) or not self._inside_map(self.goal):
+            print('Início ou destino fora dos limites do mapa.')
+            return None, None
+        if not self.safe_map[self.start]:
+            print('O início não é conhecido como livre com a margem configurada.')
+            return None, None
 
-        Returns:
-            dict: Predecessores dos nós no caminho. Se o caminho não for encontrado, retorna None.
-            tuple: O ponto final (objetivo) ou None se não encontrado.
-        """
+        start_heuristic = self._distance_to_exit(self.start) if self.goal_is_exit else self.heuristic(self.start, self.goal)
+        frontier = [(start_heuristic, 0.0, self.start)]
+        came_from = {}
+        cost_so_far = {self.start: 0.0}
+        best_node = self.start
+        best_score = (start_heuristic, 0.0)
 
-        print("Caminho não encontrado")
+        while frontier:
+            _, current_cost, current = heapq.heappop(frontier)
+            if current_cost != cost_so_far.get(current):
+                continue
+
+            current_heuristic = self._distance_to_exit(current) if self.goal_is_exit else self.heuristic(current, self.goal)
+            if (current_heuristic, current_cost) < best_score:
+                best_node = current
+                best_score = (current_heuristic, current_cost)
+            if (self._is_exit(current) if self.goal_is_exit else current == self.goal):
+                self.GOAL_REACHEABLE = True
+                return came_from, current
+
+            for row_delta, column_delta in self.DIRECTIONS:
+                neighbor = (current[0] + row_delta, current[1] + column_delta)
+                if not self._inside_map(neighbor) or not self.safe_map[neighbor]:
+                    continue
+
+                step_cost = 1.0 + self.potential_field[neighbor]
+                candidate_cost = current_cost + step_cost
+                if candidate_cost >= cost_so_far.get(neighbor, math.inf):
+                    continue
+
+                came_from[neighbor] = current
+                cost_so_far[neighbor] = candidate_cost
+                heuristic = self._distance_to_exit(neighbor) if self.goal_is_exit else self.heuristic(neighbor, self.goal)
+                priority = candidate_cost + heuristic
+                heapq.heappush(frontier, (priority, candidate_cost, neighbor))
+
+        if best_node != self.start:
+            print('Borda ainda desconhecida; planejando até o trecho seguro mais próximo.')
+            return came_from, best_node
+
+        self.GOAL_REACHEABLE = False
+        print('Nenhum caminho seguro conhecido avança em direção à borda selecionada.')
         return None, None
 
-    def reconstruct_path(self, came_from: dict, current: tuple) -> list:
-        """
-        Reconstrói o caminho a partir do ponto final até o inicial.
-        
-        Args:
-            came_from (dict): O dicionário de predecessores no caminho.
-            current (tuple): O ponto final (objetivo).
-        
-        Returns:
-            list: Lista de tuplas com caminho reconstruído.
-        """
-        return None
+    def reconstruct_path(self, came_from: dict, current: tuple[int, int]) -> list[tuple[int, int]]:
+        """Reconstrói a sequência de células desde o início até o destino parcial."""
+        path = [current]
+        while current in came_from:
+            current = came_from[current]
+            path.append((current[0], current[1]))
+        path.reverse()
+        return path
 
-    def know_path(self, path: list) -> list:
-        """
-        Remove trechos desconhecidos e ajusta o caminho, se necessário.
+    def know_path(self, path: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Corta o caminho no primeiro pixel desconhecido ou fora da margem."""
+        safe_path = []
+        for index, point in enumerate(path):
+            if not self._inside_map(point) or not self.safe_map[point]:
+                break
+            safe_path.append(point)
+        return safe_path
 
-        Args:
-            path (list): Caminho completo.
+    def _line_is_safe(self, start: tuple[int, int], end: tuple[int, int]) -> bool:
+        """Verifica as células tocadas por uma linha, incluindo cruzamentos diagonais."""
+        row, column = start
+        row_delta = end[0] - row
+        column_delta = end[1] - column
+        row_steps = abs(row_delta)
+        column_steps = abs(column_delta)
+        row_direction = 1 if row_delta > 0 else -1
+        column_direction = 1 if column_delta > 0 else -1
+        row_progress = 0
+        column_progress = 0
+        cells = [(row, column)]
 
-        Returns:
-            list: Caminho ajustado.
-        """
-        return None
+        while row_progress < row_steps or column_progress < column_steps:
+            decision = (1 + 2 * column_progress) * row_steps - (1 + 2 * row_progress) * column_steps
+            if decision == 0:
+                cells.extend(((row, column + column_direction), (row + row_direction, column)))
+                row += row_direction
+                column += column_direction
+                row_progress += 1
+                column_progress += 1
+            elif decision < 0:
+                column += column_direction
+                column_progress += 1
+            else:
+                row += row_direction
+                row_progress += 1
+            cells.append((row, column))
 
-    def simplify_path(self, path: list) -> list:
-        """
-        Simplifica o caminho removendo direções repetidas.
-        
-        Args:
-            path (list): Caminho completo.
+        return all(self._inside_map(point) and self.safe_map[point] for point in cells)
 
-        Returns:
-            list: Caminho simplificado.
-        """
-        return None
+    def simplify_path(self, path: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Usa o waypoint mais distante visível sem sair da margem segura."""
+        if len(path) <= 2:
+            return path.copy()
 
-    def plot_path(self, path: list, simplified_path: list):
-        """
-        Exibe o mapa com o caminho completo e o simplificado.
+        simplified = [path[0]]
+        index = 0
+        while index < len(path) - 1:
+            candidate = len(path) - 1
+            while candidate > index + 1 and not self._line_is_safe(path[index], path[candidate]):
+                candidate -= 1
+            simplified.append(path[candidate])
+            index = candidate
+        return simplified
 
-        Args:
-            path (list): O caminho completo encontrado.
-            simplified_path (list): O caminho simplificado encontrado.
-        """
-        simplified_path = self.simplify_path(path)
-
-        plt.figure(figsize=(10, 10))
-        plt.imshow(self.map, cmap='gray')
-        plt.scatter(self.start[1], self.start[0], color='green', s=100, label='Início')
-        plt.scatter(self.goal[1], self.goal[0], color='blue', s=100, label='Objetivo')
+    def plot_path(self, path: list[tuple[int, int]], simplified_path: list[tuple[int, int]]):
+        """Exibe apenas o trecho seguro conhecido, além do destino solicitado."""
+        plt.figure(figsize=(10, 7))
+        plt.imshow(self.map_array, cmap='gray', vmin=0, vmax=255, origin='upper')
+        plt.scatter(self.start[1], self.start[0], color='green', s=80, label='Início')
+        plt.scatter(self.goal[1], self.goal[0], color='blue', s=80, label='Destino')
 
         if path:
             path_x, path_y = zip(*path)
-            plt.plot(path_y, path_x, color='magenta', linewidth=1, label='Caminho Completo')
-            simp_x, simp_y = zip(*simplified_path)
-            plt.plot(simp_y, simp_x, color='red', linewidth=2, linestyle='--', label='Caminho Simplificado')
-        else:
-            plt.title("Caminho não encontrado")
+            plt.plot(path_y, path_x, color='magenta', linewidth=1, label='Trecho conhecido seguro')
+        if simplified_path:
+            way_x, way_y = zip(*simplified_path)
+            plt.plot(way_y, way_x, color='red', linewidth=2, linestyle='--', label='Pontos de navegação')
 
         plt.legend()
         plt.axis('equal')
         plt.show()
 
-    def run(self, show_path=True):
-        """
-        Essa função é chamada pelo navegador para executar o algoritmo A* e gerar o caminho.
-        Executa o processo completo: busca, reconstrução, simplificação e visualização do caminho.
-        
-        Args:
-            show_path (bool): Se True, exibe o caminho graficamente.
-
-        Returns:
-            list or None: Caminho simplificado ou None se não encontrado.
-        """
-        print("Iniciando busca pelo caminho...")
+    def run(self, show_path: bool = True) -> list[tuple[int, int]] | None:
+        """Retorna o caminho conhecido, seguro e simplificado até a borda."""
         came_from, final_node = self.find_path()
+        if final_node is None:
+            return []
 
-        if final_node:
-            print("Reconstruindo caminho...")
-            path = self.reconstruct_path(came_from, final_node)
-            
-            print("Robo não anda no disconhecido")
-            path = self.know_path(path)
+        planned_path = self.reconstruct_path(came_from, final_node)
+        safe_path = self.know_path(planned_path)
+        if not safe_path:
+            print('Nenhum trecho conhecido com folga suficiente para avançar.')
+            return []
 
-            print("Caminho encontrado, simplificando...")
-            simplified_path = self.simplify_path(path)
+        waypoints = self.simplify_path(safe_path)
+        if len(safe_path) == 1 and self.start != self.goal:
+            print('Sem avanço seguro conhecido; atualize o mapa antes de continuar.')
+            return []
 
-            print("Plotando o caminho...")
-            if show_path:
-                self.plot_path(path, simplified_path)
-            
-            return simplified_path
-        else:
-            print("Nenhum caminho pôde ser encontrado.")
-            return None
+        if show_path:
+            self.plot_path(safe_path, waypoints)
+        return waypoints
 
 
-def prep_map(map_path: str) -> np.array:
-    """
-    Prepara o mapa carregando e processando a imagem de entrada.
-
-    Args:
-        map_path (str): O caminho do arquivo do mapa.
-
-    Returns:
-        np.array: O mapa processado como um array numpy.
-    """
+def prep_map(map_path: str) -> np.ndarray:
+    """Carrega um PGM sem filtrar paredes finas e mantém a orientação do template."""
     map_array = cv2.imread(map_path, cv2.IMREAD_GRAYSCALE)
-    map_array[map_array == 0] = 0
-    map_array[map_array == 205] = 128
-    map_array[map_array == 254] = 255
-    map_array[(map_array >= 60) & (map_array != 128) & (map_array != 255)] = 0
-    map_array = map_array.astype(np.uint8)
-    kernel = np.ones((3, 3), np.uint8)
-    map_array = cv2.morphologyEx(map_array, cv2.MORPH_OPEN, kernel)
-    map_array = np.flipud(map_array)
-    map_array = np.pad(map_array, ((0, 200), (0, 200)), 'constant', constant_values=128)
-    return map_array
+    if map_array is None:
+        raise FileNotFoundError(f'Não foi possível carregar o mapa: {map_path}')
+
+    normalized = AStarPathfinder.preprocess_map(map_array)
+    return np.flipud(normalized).copy()
 
 
 def main():
-    map_array = prep_map('map5.pgm')
-    astar = AStarPathfinder(map_array, (60, 20), (60, 120), wall_influence=10.0, buffer_factor=3.0)
-    astar.run()
+    start = (60, 20)
+    for snapshot in range(1, 6):
+        map_array = prep_map(f'map{snapshot}.pgm')
+        astar = AStarPathfinder(
+            map_array,
+            start,
+            wall_influence=10.0,
+            buffer_factor=3.0,
+            safety_margin=2.0,
+            exit_side='east',
+        )
+        waypoints = astar.run(show_path=snapshot == 5)
+        print(f'map{snapshot}: início={start}, waypoints={waypoints}')
+        if waypoints:
+            start = waypoints[-1]
 
 
 if __name__ == '__main__':
