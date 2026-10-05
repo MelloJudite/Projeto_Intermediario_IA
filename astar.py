@@ -2,418 +2,278 @@ import heapq
 import math
 
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
+LIVRE = 255        
+DESCONHECIDO = 128 
+PAREDE = 0      
 
 class AStarPathfinder:
-    DIRECTIONS = ((-1, 0), (0, 1), (1, 0), (0, -1))
-
-    def __init__(
-        self,
-        map_array: np.ndarray,
-        start: tuple[int, int],
-        goal: tuple[int, int] | None = None,
-        wall_influence: float = 10.0,
-        buffer_factor: float = 2.0,
-        safety_margin: float = 2.0,
-        exit_side: str = 'east',
-        start_snap_radius: int = 10,
-        frontier_band: float = 1.0,
-        wall_margin: float | None = None,
-    ):
-        """Cria um planejador em coordenadas de pixel (linha, coluna).
-
-        Sem goal explícito, planeja em direção à borda indicada por exit_side.
-        Se ela ainda não estiver mapeada, retorna o trecho seguro conhecido mais
-        próximo dela. Folgas e custos são expressos em pixels do mapa.
-
-        Se o início (posição do robô) cair fora da margem segura, ele é movido
-        para a célula segura mais próxima dentro de start_snap_radius pixels.
-
-        safety_margin: folga mínima (px) de paredes E de áreas desconhecidas.
-        wall_margin: folga extra (px) só das paredes. Se None, usa safety_margin.
-            Use um valor maior que safety_margin para afastar mais o robô das paredes.
-            Também sela vãos entre pixels de parede (paredes pontilhadas/diagonais
-            por vazamento do laser): vãos menores que ~2*(wall_margin + 0.7) px
-            ficam bloqueados.
-        """
-        if wall_influence < 0 or buffer_factor < 0:
-            raise ValueError('Pesos e distâncias não podem ser negativos.')
-        if safety_margin < 0:
-            raise ValueError('A margem de segurança não pode ser negativa.')
-        if wall_margin is not None and wall_margin < 0:
-            raise ValueError('wall_margin não pode ser negativo.')
-        if exit_side not in ('north', 'east', 'south', 'west'):
-            raise ValueError('exit_side deve ser north, east, south ou west.')
-        if len(start) != 2:
-            raise ValueError('start deve ser (linha, coluna).')
-
-        self.map_array = self.preprocess_map(map_array)
-        self.map = self.map_array
-        self.start = tuple(int(value) for value in start)
-        self.original_start = self.start
-        self.wall_influence = float(wall_influence)
-        self.buffer_factor = float(buffer_factor)
-        self.safety_margin = float(safety_margin)
-        self.exit_side = exit_side
-        self.start_snap_radius = int(start_snap_radius)
-        self.frontier_band = float(frontier_band)
-        self.wall_margin = self.safety_margin if wall_margin is None else max(float(wall_margin), self.safety_margin)
+    def __init__(self, map_array, start, goal, wall_influence=5.0, buffer_factor=2.0):
+        self.start = start
+        self.goal = goal
+        self.wall_influence = wall_influence
+        self.buffer_factor = buffer_factor
         self.GOAL_REACHEABLE = False
 
-        self.wall_mask = self.create_wall_mask()
-        self.free_mask = (self.map_array == 255) & ~self.wall_mask
-        self.wall_clearance = self.create_wall_clearance()
-        padded_free = np.pad(self.free_mask, 1, mode='constant', constant_values=True)
-        self.clearance_map = distance_transform_edt(padded_free)[1:-1, 1:-1]
-        self.safe_map = self.create_safety_margin()
+        self.min_clearance = 4.0
+
+        self.map = map_array.copy()
+        self.map_array = self.preprocess_map(map_array)
         self.potential_field = self.create_potential_field()
-        self.frontier_mask = self.create_frontier_mask()
 
-        # O robô real quase nunca está exatamente numa célula com folga total:
-        # ajusta o início para a célula segura mais próxima.
-        if self._inside_map(self.start) and not self.safe_map[self.start]:
-            snapped = self._nearest_safe_cell(self.start, self.start_snap_radius)
-            if snapped is not None:
-                print(f'Início {self.start} fora da margem; ajustado para {snapped}.')
-                self.start = snapped
+    # ---------- preparação ----------
 
-        self.goal_is_exit = goal is None
-        if goal is None:
-            self.goal = self._border_goal()
-        else:
-            self.goal = tuple(int(value) for value in goal)
+    def preprocess_map(self, map_array):
+        processed = map_array.copy()
+        processed[(processed != LIVRE) & (processed != DESCONHECIDO)] = PAREDE
+        return processed
 
-    def _border_goal(self) -> tuple[int, int]:
-        rows, columns = self.map_array.shape
-        if self.exit_side == 'north':
-            return 0, self.start[1]
-        if self.exit_side == 'south':
-            return rows - 1, self.start[1]
-        if self.exit_side == 'west':
-            return self.start[0], 0
-        return self.start[0], columns - 1
+    def create_potential_field(self):
+       
+        paredes = (self.map_array == PAREDE)
+        self.dist_to_wall = distance_transform_edt(~paredes)
+        campo = self.wall_influence * np.exp(-self.dist_to_wall / self.buffer_factor)
+        campo[paredes] = 0.0
+        return campo
 
-    @staticmethod
-    def preprocess_map(map_array: np.ndarray) -> np.ndarray:
-        """Normaliza o mapa para parede=0, desconhecido=128 e livre=255."""
-        source = np.asarray(map_array)
-        if source.ndim != 2:
-            raise ValueError('O mapa precisa ser uma imagem em escala de cinza 2D.')
+    def heuristic(self, a, b):
+        return math.hypot(a[0] - b[0], a[1] - b[1])
 
-        result = np.zeros(source.shape, dtype=np.uint8)
-        result[(source == 128) | (source == 205)] = 128
-        result[source >= 240] = 255
-        return result
-
-    def create_potential_field(self) -> np.ndarray:
-        """Aumenta o custo perto de paredes e de áreas ainda não mapeadas."""
-        influence_range = max(self.buffer_factor, 1.0)
-        return self.wall_influence * np.exp(-self.clearance_map / influence_range)
-
-    def create_wall_mask(self) -> np.ndarray:
-        """Pixels de parede do mapa."""
-        return self.map_array == 0
-
-    def create_wall_clearance(self) -> np.ndarray:
-        """Distância (px) de cada célula até a parede mais próxima."""
-        if not self.wall_mask.any():
-            return np.full(self.wall_mask.shape, np.inf)
-        return distance_transform_edt(~self.wall_mask)
-
-    def create_safety_margin(self) -> np.ndarray:
-        """Bloqueia células perto demais de paredes (borda wall_margin) ou do desconhecido."""
-        half_cell = math.sqrt(2) / 2
-        return (
-            self.free_mask
-            & (self.clearance_map >= self.safety_margin + half_cell)
-            & (self.wall_clearance >= self.wall_margin + half_cell)
-        )
-
-    def create_frontier_mask(self) -> np.ndarray:
-        """Células seguras que encostam em área desconhecida (fronteiras de exploração).
-
-        Pixels desconhecidos isolados (riscos de 1 px junto às paredes) são
-        removidos com uma abertura morfológica, para não virarem fronteira falsa.
-        """
-        unknown = (self.map_array == 128).astype(np.uint8)
-        solid_unknown = cv2.morphologyEx(unknown, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)).astype(bool)
-        if not solid_unknown.any():
-            return np.zeros_like(self.safe_map)
-
-        distance_to_unknown = distance_transform_edt(~solid_unknown)
-        limit = self.safety_margin + math.sqrt(2) / 2 + self.frontier_band
-        return self.safe_map & (distance_to_unknown <= limit)
-
-    @staticmethod
-    def heuristic(a: tuple[int, int], b: tuple[int, int]) -> float:
-        """Distância Manhattan, adequada aos movimentos ortogonais do robô."""
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
-    def _inside_map(self, point: tuple[int, int]) -> bool:
-        return 0 <= point[0] < self.map_array.shape[0] and 0 <= point[1] < self.map_array.shape[1]
-
-    def _nearest_safe_cell(self, point: tuple[int, int], radius: int) -> tuple[int, int] | None:
-        """Célula segura mais próxima de point dentro de radius pixels."""
-        if not self._inside_map(point):
-            return None
-        if self.safe_map[point]:
-            return point
-
-        rows, columns = self.safe_map.shape
-        row_min = max(point[0] - radius, 0)
-        row_max = min(point[0] + radius + 1, rows)
-        col_min = max(point[1] - radius, 0)
-        col_max = min(point[1] + radius + 1, columns)
-
-        cells = np.argwhere(self.safe_map[row_min:row_max, col_min:col_max])
-        if cells.size == 0:
-            return None
-        cells = cells + np.array([row_min, col_min])
-        distances = np.hypot(cells[:, 0] - point[0], cells[:, 1] - point[1])
-        best = int(np.argmin(distances))
-        if distances[best] > radius:
-            return None
-        return int(cells[best, 0]), int(cells[best, 1])
-
-    def _distance_to_exit(self, point: tuple[int, int]) -> int:
-        rows, columns = self.map_array.shape
-        if self.exit_side == 'north':
-            return point[0]
-        if self.exit_side == 'south':
-            return rows - 1 - point[0]
-        if self.exit_side == 'west':
-            return point[1]
-        return columns - 1 - point[1]
-
-    def _is_exit(self, point: tuple[int, int]) -> bool:
-        row, column = point
-        rows, columns = self.map_array.shape
-        return {
-            'north': row == 0,
-            'east': column == columns - 1,
-            'south': row == rows - 1,
-            'west': column == 0,
-        }[self.exit_side]
 
     def find_path(self):
-        """Executa A* somente sobre células livres que respeitam a margem."""
-        if not self._inside_map(self.start) or not self._inside_map(self.goal):
-            print('Início ou destino fora dos limites do mapa.')
-            return None, None
-        if not self.safe_map[self.start]:
-            print('O início não é conhecido como livre com a margem configurada.')
-            return None, None
+        """Devolve (came_from, nó_final), ou (None, None) se não achar caminho."""
+        start, goal = self.start, self.goal
+        linhas, colunas = self.map_array.shape
 
-        start_heuristic = self._distance_to_exit(self.start) if self.goal_is_exit else self.heuristic(self.start, self.goal)
-        frontier = [(start_heuristic, 0.0, self.start)]
-        came_from = {}
-        cost_so_far = {self.start: 0.0}
-        best_node = self.start
-        best_score = (start_heuristic, 0.0)
-        best_frontier = None
-        best_frontier_score = math.inf
+        def dentro(r, c):
+            return 0 <= r < linhas and 0 <= c < colunas
 
-        while frontier:
-            _, current_cost, current = heapq.heappop(frontier)
-            if current_cost != cost_so_far.get(current):
+        def sem_parede(r, c):
+            return self.map_array[r, c] != PAREDE
+
+        if not dentro(*goal) or not sem_parede(*goal):
+            goal = self._nearest_free(goal)
+            if goal is None:
+                print("Caminho não encontrado")
+                return None, None
+            self.goal = goal
+
+        fila = [(self.heuristic(start, goal), 0.0, start)]  # (f, g, célula)
+        came_from = {start: None}
+        g_score = {start: 0.0}
+        visitados = set()
+
+        raiz2 = math.sqrt(2)
+        vizinhos = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+                    (-1, -1, raiz2), (-1, 1, raiz2), (1, -1, raiz2), (1, 1, raiz2)]
+
+        while fila:
+            _, g, atual = heapq.heappop(fila)
+            if atual in visitados:
                 continue
+            visitados.add(atual)
 
-            current_heuristic = self._distance_to_exit(current) if self.goal_is_exit else self.heuristic(current, self.goal)
-            if (current_heuristic, current_cost) < best_score:
-                best_node = current
-                best_score = (current_heuristic, current_cost)
-            if current != self.start and self.frontier_mask[current]:
-                frontier_score = current_cost + current_heuristic
-                if frontier_score < best_frontier_score:
-                    best_frontier = current
-                    best_frontier_score = frontier_score
-            if (self._is_exit(current) if self.goal_is_exit else current == self.goal):
-                self.GOAL_REACHEABLE = True
-                return came_from, current
+            if atual == goal:
+                self.GOAL_REACHEABLE = (self.map[goal[0], goal[1]] == LIVRE)
+                return came_from, atual
 
-            for row_delta, column_delta in self.DIRECTIONS:
-                neighbor = (current[0] + row_delta, current[1] + column_delta)
-                if not self._inside_map(neighbor) or not self.safe_map[neighbor]:
+            r, c = atual
+            for dr, dc, passo in vizinhos:
+                nr, nc = r + dr, c + dc
+                if not dentro(nr, nc) or not sem_parede(nr, nc):
                     continue
 
-                step_cost = 1.0 + self.potential_field[neighbor]
-                candidate_cost = current_cost + step_cost
-                if candidate_cost >= cost_so_far.get(neighbor, math.inf):
-                    continue
+                if dr != 0 and dc != 0:
+                    if not sem_parede(r + dr, c) or not sem_parede(r, c + dc):
+                        continue
 
-                came_from[neighbor] = current
-                cost_so_far[neighbor] = candidate_cost
-                heuristic = self._distance_to_exit(neighbor) if self.goal_is_exit else self.heuristic(neighbor, self.goal)
-                priority = candidate_cost + heuristic
-                heapq.heappush(frontier, (priority, candidate_cost, neighbor))
+                custo = passo + self.potential_field[nr, nc]
+                if self.map_array[nr, nc] == DESCONHECIDO:
+                    custo += 0.1  # preferência leve pelo que já é conhecido
 
-        # Borda inalcançável: explora a melhor fronteira (limite entre livre e
-        # desconhecido). Ir só ao ponto mais perto da borda prende o robô em becos
-        # sem saída, pois o início já pode ser o ponto mais próximo dela.
-        if best_frontier is not None:
-            print('Borda ainda desconhecida; indo até a melhor fronteira de exploração.')
-            return came_from, best_frontier
+                novo_g = g + custo
+                if novo_g < g_score.get((nr, nc), math.inf):
+                    g_score[(nr, nc)] = novo_g
+                    came_from[(nr, nc)] = atual
+                    f = novo_g + self.heuristic((nr, nc), goal)
+                    heapq.heappush(fila, (f, novo_g, (nr, nc)))
 
-        if best_node != self.start:
-            print('Sem fronteira alcançável; indo ao trecho seguro mais próximo da borda.')
-            return came_from, best_node
-
-        self.GOAL_REACHEABLE = False
-        print('Nenhum caminho seguro conhecido avança em direção à borda selecionada.')
+        print("Caminho não encontrado")
         return None, None
 
-    def reconstruct_path(self, came_from: dict, current: tuple[int, int]) -> list[tuple[int, int]]:
-        """Reconstrói a sequência de células desde o início até o destino parcial."""
+    def _nearest_free(self, cell):
+        r0, c0 = int(round(cell[0])), int(round(cell[1]))
+        livres = np.argwhere(self.map_array != PAREDE)
+        if len(livres) == 0:
+            return None
+
+        melhor, melhor_d = None, math.inf
+        for r, c in livres:
+            d = (r - r0) ** 2 + (c - c0) ** 2
+            if d < melhor_d:
+                melhor_d, melhor = d, (int(r), int(c))
+        return melhor
+
+    def reconstruct_path(self, came_from, current):
         path = [current]
-        while current in came_from:
-            current = came_from[current]
-            path.append((current[0], current[1]))
+        while came_from.get(path[-1]) is not None:
+            path.append(came_from[path[-1]])
         path.reverse()
         return path
 
-    def know_path(self, path: list[tuple[int, int]]) -> list[tuple[int, int]]:
-        """Corta o caminho no primeiro pixel desconhecido ou fora da margem."""
-        safe_path = []
-        for point in path:
-            if not self._inside_map(point) or not self.safe_map[point]:
+    def know_path(self, path):
+       
+        if not path:
+            return path
+
+        conhecido = [path[0]]
+        for cell in path[1:]:
+            if self.map[cell[0], cell[1]] != LIVRE:
                 break
-            safe_path.append(point)
-        return safe_path
+            conhecido.append(cell)
+        return conhecido
 
-    def _line_is_safe(self, start: tuple[int, int], end: tuple[int, int]) -> bool:
-        """Verifica as células tocadas por uma linha, incluindo cruzamentos diagonais."""
-        row, column = start
-        row_delta = end[0] - row
-        column_delta = end[1] - column
-        row_steps = abs(row_delta)
-        column_steps = abs(column_delta)
-        row_direction = 1 if row_delta > 0 else -1
-        column_direction = 1 if column_delta > 0 else -1
-        row_progress = 0
-        column_progress = 0
-        cells = [(row, column)]
 
-        while row_progress < row_steps or column_progress < column_steps:
-            decision = (1 + 2 * column_progress) * row_steps - (1 + 2 * row_progress) * column_steps
-            if decision == 0:
-                cells.extend(((row, column + column_direction), (row + row_direction, column)))
-                row += row_direction
-                column += column_direction
-                row_progress += 1
-                column_progress += 1
-            elif decision < 0:
-                column += column_direction
-                column_progress += 1
-            else:
-                row += row_direction
-                row_progress += 1
-            cells.append((row, column))
+    def simplify_path(self, path):
+      
+        if not path or len(path) < 3:
+            return path
 
-        return all(self._inside_map(point) and self.safe_map[point] for point in cells)
+        reduzido = [path[0]]
+        for i in range(1, len(path) - 1):
+            dir_antes = (path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1])
+            dir_depois = (path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1])
+            if dir_antes != dir_depois:
+                reduzido.append(path[i])
+        reduzido.append(path[-1])
 
-    def simplify_path(self, path: list[tuple[int, int]]) -> list[tuple[int, int]]:
-        """Usa o waypoint mais distante visível sem sair da margem segura."""
-        if len(path) <= 2:
-            return path.copy()
+        suave = [reduzido[0]]
+        ancora = 0
+        while ancora < len(reduzido) - 1:
+            proximo = ancora + 1
+            for cand in range(len(reduzido) - 1, ancora, -1):
+                if self._segmento_seguro(reduzido[ancora], reduzido[cand]):
+                    proximo = cand
+                    break
+            suave.append(reduzido[proximo])
+            ancora = proximo
 
-        simplified = [path[0]]
-        index = 0
-        while index < len(path) - 1:
-            candidate = len(path) - 1
-            while candidate > index + 1 and not self._line_is_safe(path[index], path[candidate]):
-                candidate -= 1
-            simplified.append(path[candidate])
-            index = candidate
-        return simplified
+        return self._chaikin_seguro(suave, iteracoes=3)
 
-    def plot_path(self, path: list[tuple[int, int]], simplified_path: list[tuple[int, int]]):
-        """Exibe apenas o trecho seguro conhecido, além do destino solicitado."""
-        import matplotlib.pyplot as plt  # só é importado se alguém pedir o gráfico
+    def _chaikin_seguro(self, pontos, iteracoes=3):
+      
+        pts = [tuple(map(float, p)) for p in pontos]
 
-        plt.figure(figsize=(10, 7))
-        plt.imshow(self.map_array, cmap='gray', vmin=0, vmax=255, origin='upper')
-        plt.scatter(self.start[1], self.start[0], color='green', s=80, label='Início')
-        plt.scatter(self.goal[1], self.goal[0], color='blue', s=80, label='Destino')
+        for _ in range(iteracoes):
+            if len(pts) < 3:
+                break
+
+            novo = [pts[0]]
+            for i in range(1, len(pts) - 1):
+                a, v, b = novo[-1], pts[i], pts[i + 1]
+                q1 = (0.75 * v[0] + 0.25 * a[0], 0.75 * v[1] + 0.25 * a[1])
+                q2 = (0.75 * v[0] + 0.25 * b[0], 0.75 * v[1] + 0.25 * b[1])
+
+                if self._segmento_seguro(a, q1) and self._segmento_seguro(q1, q2):
+                    novo.extend([q1, q2])
+                else:
+                    novo.append(v)
+            novo.append(pts[-1])
+            pts = novo
+
+        return pts
+
+    def _segmento_seguro(self, a, b):
+        dist = math.hypot(b[0] - a[0], b[1] - a[1])
+        n = max(2, int(dist * 3) + 1)
+
+        for t in np.linspace(0, 1, n):
+            r = int(round(a[0] + (b[0] - a[0]) * t))
+            c = int(round(a[1] + (b[1] - a[1]) * t))
+            if self.map_array[r, c] == PAREDE:
+                return False
+            if self.dist_to_wall[r, c] < self.min_clearance:
+                return False
+        return True
+
+    def path_to_xy(self, path):
+        return [(round(float(c), 2), round(float(r), 2)) for r, c in path]
+
+    def plot_path(self, path, simplified_path, save_path=None):
+        plt.figure(figsize=(10, 10))
+        plt.imshow(self.map, cmap='gray')
+        plt.scatter(self.start[1], self.start[0], color='green', s=100, label='Início')
+        plt.scatter(self.goal[1], self.goal[0], color='blue', s=100, label='Objetivo')
 
         if path:
-            path_x, path_y = zip(*path)
-            plt.plot(path_y, path_x, color='magenta', linewidth=1, label='Trecho conhecido seguro')
-        if simplified_path:
-            way_x, way_y = zip(*simplified_path)
-            plt.plot(way_y, way_x, color='red', linewidth=2, linestyle='--', label='Pontos de navegação')
+            linhas, colunas = zip(*path)
+            plt.plot(colunas, linhas, color='magenta', linewidth=1, label='Caminho completo')
+            s_linhas, s_colunas = zip(*simplified_path)
+            plt.plot(s_colunas, s_linhas, color='red', linewidth=2,
+                     linestyle='--', label='Caminho simplificado')
+        else:
+            plt.title("Caminho não encontrado")
 
         plt.legend()
         plt.axis('equal')
+        if save_path:
+            plt.savefig(save_path, dpi=120, bbox_inches='tight')
+            print(f"Gráfico salvo em: {save_path}")
         plt.show()
 
-    def run(self, show_path: bool = False) -> list[tuple[int, int]]:
-        """Retorna os waypoints seguros até a borda.
+    def run(self, show_path=True, save_path=None):
+        
+        print("Procurando caminho...")
+        came_from, no_final = self.find_path()
 
-        A lista pode vir VAZIA (sem caminho seguro) ou com 1 ponto apenas.
-        Use next_waypoint() em vez de indexar diretamente.
-        """
-        came_from, final_node = self.find_path()
-        if final_node is None:
-            return []
+        if not no_final:
+            print("Nenhum caminho encontrado.")
+            self.caminho_xy = None
+            return None
 
-        planned_path = self.reconstruct_path(came_from, final_node)
-        safe_path = self.know_path(planned_path)
-        if not safe_path:
-            print('Nenhum trecho conhecido com folga suficiente para avançar.')
-            return []
+        path = self.reconstruct_path(came_from, no_final)
 
-        if len(safe_path) == 1 and self.start != self.goal:
-            print('Sem avanço seguro conhecido; atualize o mapa antes de continuar.')
-            return []
+        path = self.know_path(path)
 
-        waypoints = self.simplify_path(safe_path)
+        print("Simplificando caminho...")
+        simplificado = self.simplify_path(path)
+
+        self.caminho_xy = self.path_to_xy(simplificado)
+        print(f"Caminho com {len(self.caminho_xy)} pontos (x, y):")
+        print(self.caminho_xy)
+
         if show_path:
-            self.plot_path(safe_path, waypoints)
-        return waypoints
+            self.plot_path(path, simplificado, save_path=save_path)
 
-    @staticmethod
-    def next_waypoint(waypoints: list[tuple[int, int]]) -> tuple[int, int] | None:
-        """Próximo alvo do robô (pula o ponto atual). None se não há para onde ir."""
-        if len(waypoints) >= 2:
-            return waypoints[1]
-        if len(waypoints) == 1:
-            return waypoints[0]
-        return None
+        return simplificado
 
 
-def prep_map(map_path: str) -> np.ndarray:
-    """Carrega um PGM sem filtrar paredes finas e mantém a orientação do template."""
-    map_array = cv2.imread(map_path, cv2.IMREAD_GRAYSCALE)
-    if map_array is None:
-        raise FileNotFoundError(f'Não foi possível carregar o mapa: {map_path}')
+def prep_map(map_path):
+    """Carrega o .pgm e deixa só 0 (parede), 128 (desconhecido) e 255 (livre)."""
+    mapa = cv2.imread(map_path, cv2.IMREAD_GRAYSCALE)
+    mapa[mapa == 205] = 128
+    mapa[mapa == 254] = 255
+    mapa[(mapa >= 60) & (mapa != 128) & (mapa != 255)] = 0
+    mapa = mapa.astype(np.uint8)
 
-    normalized = AStarPathfinder.preprocess_map(map_array)
-    return np.flipud(normalized).copy()
+    mapa = cv2.morphologyEx(mapa, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    mapa = np.flipud(mapa)
+
+    return np.pad(mapa, ((0, 200), (0, 200)), 'constant', constant_values=128)
 
 
 def main():
-    start = (60, 20)
-    for snapshot in range(1, 6):
-        map_array = prep_map(f'map{snapshot}.pgm')
-        astar = AStarPathfinder(
-            map_array,
-            start,
-            wall_influence=10.0,
-            buffer_factor=3.0,
-            safety_margin=2.0,
-            wall_margin=4.0,
-            exit_side='east',
-        )
-        waypoints = astar.run()
-        print(f'map{snapshot}: início={start}, waypoints={waypoints}')
-
-        target = AStarPathfinder.next_waypoint(waypoints)
-        if target is None:
-            print('Sem alvo seguro; robô deve parar/girar e atualizar o mapa.')
-            continue
-        start = waypoints[-1]
+    for i in range(1, 6):
+        print(f"\n===== map{i}.pgm =====")
+        mapa = prep_map(f'map{i}.pgm')
+        astar = AStarPathfinder(mapa, (60, 20), (60, 120),
+                                wall_influence=10.0, buffer_factor=3.0)
+        caminho = astar.run(save_path=f'caminho_map{i}.png')
+        if caminho:
+            print(f"Objetivo alcançável (região conhecida): {astar.GOAL_REACHEABLE}")
 
 
 if __name__ == '__main__':
